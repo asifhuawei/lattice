@@ -2,10 +2,10 @@ package app_examiner
 
 import (
 	"errors"
-	"sort"
-
 	"github.com/cloudfoundry-incubator/lattice/ltc/route_helpers"
 	"github.com/cloudfoundry-incubator/receptor"
+	as "github.com/cloudfoundry-incubator/runtime-schema/models"
+	"sort"
 )
 
 const AppNotFoundErrorMessage = "App not found."
@@ -57,6 +57,15 @@ type InstanceMetrics struct {
 	DiskBytes     uint64
 }
 
+type TaskInfo struct {
+	TaskGuid      string
+	CellID        string
+	Failed        bool
+	FailureReason string
+	Result        string
+	State         string
+}
+
 type instanceInfoSortableByIndex []InstanceInfo
 
 func (x instanceInfoSortableByIndex) Len() int {
@@ -82,6 +91,8 @@ type CellInfo struct {
 type AppExaminer interface {
 	ListApps() ([]AppInfo, error)
 	ListCells() ([]CellInfo, error)
+	ListTasks() ([]TaskInfo, error)
+	ListTaskById(taskGuid string) (TaskInfo, error)
 	AppStatus(appName string) (AppInfo, error)
 	AppExists(name string) (bool, error)
 	RunningAppInstancesInfo(name string) (int, bool, error)
@@ -342,4 +353,66 @@ func sortCellKeys(allApps map[string]*CellInfo) []string {
 	sort.Strings(keys)
 
 	return keys
+}
+
+/*
+type RunAction struct {
+	Path           string                `json:"path"`
+	Args           []string              `json:"args"`
+	Dir            string                `json:"dir,omitempty"`
+	Env            []EnvironmentVariable `json:"env"`
+	ResourceLimits ResourceLimits        `json:"resource_limits"`
+	Privileged     bool                  `json:"privileged,omitempty"`
+
+	LogSource string `json:"log_source,omitempty"`
+}
+
+type ResourceLimits struct {
+	Nofile *uint64 `json:"nofile,omitempty"`
+}
+*/
+func (e *appExaminer) ListTasks() ([]TaskInfo, error) {
+
+	taskToCreate := receptor.TaskCreateRequest{
+		TaskGuid: "task-guid-1",
+		Domain:   "test-domain",
+		RootFS:   "lucid64",
+		Action:   &as.RunAction{Path: "/bin/bash", Args: []string{"echo", "hi", ";", "sleep", "100"}},
+	}
+	e.receptorClient.CreateTask(taskToCreate)
+
+	tasksList, err := e.receptorClient.Tasks()
+	taskMap := make([]TaskInfo, 0, 10)
+	for _, tasks := range tasksList {
+		taskss := TaskInfo{
+			TaskGuid:      tasks.TaskGuid,
+			CellID:        tasks.CellID,
+			Failed:        tasks.Failed,
+			FailureReason: tasks.FailureReason,
+			Result:        tasks.Result,
+			State:         tasks.State,
+		}
+		taskMap = append(taskMap, taskss)
+	}
+	return taskMap, err
+}
+
+func (e *appExaminer) ListTaskById(taskGuid string) (TaskInfo, error) {
+
+	dummyTask := TaskInfo{}
+	taskInfo, err := e.receptorClient.GetTask(taskGuid)
+	if err != nil {
+		return dummyTask, err
+	}
+	taskInformation := TaskInfo{
+		TaskGuid:      taskInfo.TaskGuid,
+		CellID:        taskInfo.CellID,
+		Failed:        taskInfo.Failed,
+		FailureReason: taskInfo.FailureReason,
+		Result:        taskInfo.Result,
+		State:         taskInfo.State,
+	}
+
+	return taskInformation, nil
+
 }

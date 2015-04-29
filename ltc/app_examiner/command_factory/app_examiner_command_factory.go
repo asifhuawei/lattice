@@ -1,6 +1,7 @@
 package command_factory
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -10,20 +11,27 @@ import (
 	"time"
 
 	"github.com/cloudfoundry-incubator/lattice/ltc/app_examiner"
-	"github.com/cloudfoundry-incubator/lattice/ltc/app_examiner/command_factory/graphical"
 	"github.com/cloudfoundry-incubator/lattice/ltc/app_examiner/command_factory/presentation"
 	"github.com/cloudfoundry-incubator/lattice/ltc/exit_handler"
 	"github.com/cloudfoundry-incubator/lattice/ltc/terminal"
 	"github.com/cloudfoundry-incubator/lattice/ltc/terminal/colors"
 	"github.com/cloudfoundry-incubator/lattice/ltc/terminal/cursor"
 	"github.com/codegangsta/cli"
+	"github.com/gizak/termui"
 	"github.com/pivotal-golang/bytefmt"
 	"github.com/pivotal-golang/clock"
 )
 
 const (
 	TimestampDisplayLayout = "2006-01-02 15:04:05 (MST)"
-	minColumnWidth         = 13
+
+	minColumnWidth     = 13
+	graphicalRateDelta = 100 * time.Millisecond
+	PendingState       = "PENDING"
+	CompletedState     = "COMPLETED"
+	ResolvingState     = "RESOLVING"
+	RunningState       = "RUNNING"
+	ClaimedState       = "CLAIMED"
 )
 
 var (
@@ -38,15 +46,14 @@ func (p UInt16Slice) Less(i, j int) bool { return p[i] < p[j] }
 func (p UInt16Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 
 type AppExaminerCommandFactory struct {
-	appExaminer         app_examiner.AppExaminer
-	ui                  terminal.UI
-	clock               clock.Clock
-	exitHandler         exit_handler.ExitHandler
-	graphicalVisualizer graphical.GraphicalVisualizer
+	appExaminer app_examiner.AppExaminer
+	ui          terminal.UI
+	clock       clock.Clock
+	exitHandler exit_handler.ExitHandler
 }
 
-func NewAppExaminerCommandFactory(appExaminer app_examiner.AppExaminer, ui terminal.UI, clock clock.Clock, exitHandler exit_handler.ExitHandler, graphicalVisualizer graphical.GraphicalVisualizer) *AppExaminerCommandFactory {
-	return &AppExaminerCommandFactory{appExaminer, ui, clock, exitHandler, graphicalVisualizer}
+func NewAppExaminerCommandFactory(appExaminer app_examiner.AppExaminer, ui terminal.UI, clock clock.Clock, exitHandler exit_handler.ExitHandler) *AppExaminerCommandFactory {
+	return &AppExaminerCommandFactory{appExaminer, ui, clock, exitHandler}
 }
 
 func (factory *AppExaminerCommandFactory) MakeListAppCommand() cli.Command {
@@ -107,6 +114,85 @@ func (factory *AppExaminerCommandFactory) MakeStatusCommand() cli.Command {
 		Description: "ltc status APP_NAME",
 		Action:      factory.appStatus,
 		Flags:       statusFlags,
+	}
+}
+
+func (factory *AppExaminerCommandFactory) MakeListTaskCommand() cli.Command {
+
+	return cli.Command{
+		Name:        "tasks",
+		Aliases:     []string{"tk"},
+		Usage:       "Shows the list of tasks running on lattice",
+		Description: "ltc tasks",
+		Action:      factory.listTasks,
+		Flags:       []cli.Flag{},
+	}
+}
+
+func (factory *AppExaminerCommandFactory) listTasks(context *cli.Context) {
+	factory.ui.Say("Displaying the tasks" + "\n")
+	if len(context.Args()) == 1 {
+		taskInfo, err := factory.appExaminer.ListTaskById(context.Args()[0])
+		if err != nil {
+			factory.ui.Say("Error while fecthing the task by GUID : " + err.Error())
+			return
+		}
+		factory.ui.Say("Task Guid :" + "\t")
+		factory.ui.Say(taskInfo.TaskGuid + "\n")
+		currentTaskState := taskInfo.State
+		switch {
+		case currentTaskState == PendingState || currentTaskState == ClaimedState || currentTaskState == RunningState:
+			factory.ui.Say("Status :" + "\t")
+			factory.ui.Say(taskInfo.State + "\n")
+			factory.ui.Say("Cell ID :" + "\t")
+			factory.ui.Say(taskInfo.CellID + "\n")
+			break
+		case (currentTaskState == CompletedState || currentTaskState == ResolvingState) && !taskInfo.Failed:
+			factory.ui.Say("Status :" + "\t")
+			factory.ui.Say(colors.Green(taskInfo.State) + "\n")
+			factory.ui.Say("Cell ID :" + "\t")
+			factory.ui.Say(taskInfo.CellID + "\n")
+			factory.ui.Say("Result :" + "\t")
+			factory.ui.Say(taskInfo.Result + "\n")
+			break
+		case taskInfo.Failed:
+			factory.ui.Say("Status :" + "\t")
+			factory.ui.Say(colors.Red(taskInfo.State) + "\n")
+			factory.ui.Say("Failiure Reason :" + "\t")
+			factory.ui.Say(taskInfo.FailureReason + "\n")
+			factory.ui.Say("Cell ID :" + "\t")
+			factory.ui.Say(taskInfo.CellID + "\n")
+			break
+		}
+		/*
+				PENDING, CLAIMED, or RUNNING 1case
+				COMPLETED or RESOLVING and task success  1 case
+				task failed 1 case
+
+
+			factory.ui.Say("Status :" + "\t")
+			factory.ui.Say(taskInfo.State + "\n")
+			factory.ui.Say("Cell ID :" + "\t")
+			factory.ui.Say(taskInfo.CellID + "\n")
+			factory.ui.Say("Result :" + "\t")
+			factory.ui.Say(taskInfo.Result + "\n")
+		*/
+
+	} else {
+		taskList, err := factory.appExaminer.ListTasks()
+		//taskGuidGiven := context.Args()[0]
+		//factory.ui.Say(taskGuidGiven)
+		if err != nil {
+			factory.ui.Say("Error listing tasks")
+			factory.ui.Say(err.Error())
+		}
+		for _, tasksInfo := range taskList {
+			factory.ui.Say("the task guid is")
+			factory.ui.Say(tasksInfo.TaskGuid)
+			factory.ui.Say("\t")
+			factory.ui.Say(tasksInfo.State)
+
+		}
 	}
 }
 
@@ -307,6 +393,7 @@ func (factory *AppExaminerCommandFactory) printInstanceInfo(actualInstances []ap
 		if instance.HasMetrics {
 			fmt.Fprintf(w, "%s \t%.2f \n", "CPU Percentage", instance.Metrics.CpuPercentage)
 			fmt.Fprintf(w, "%s \t%s \n", "Memory Usage", bytefmt.ByteSize(instance.Metrics.MemoryBytes))
+			fmt.Fprintf(w, "%s \t%s \n", "Disk Usage", bytefmt.ByteSize(instance.Metrics.DiskBytes))
 		}
 		printHorizontalRule(w, "-")
 	}
@@ -316,14 +403,15 @@ func (factory *AppExaminerCommandFactory) printInstanceInfo(actualInstances []ap
 
 func (factory *AppExaminerCommandFactory) visualizeCells(context *cli.Context) {
 	rate := context.Duration("rate")
-	graphicalFlag := context.Bool("graphical")
+	graphical := context.Bool("graphical")
 
-	if graphicalFlag {
-		err := factory.graphicalVisualizer.PrintDistributionChart(rate)
+	if graphical {
+		err := factory.printDistributionChart(rate)
 		if err != nil {
-			factory.ui.SayLine("Error Visualization: " + err.Error())
+			factory.ui.SayLine("Error Visualization:" + err.Error())
+		} else {
+			return
 		}
-		return
 	}
 
 	factory.ui.Say(colors.Bold("Distribution\n"))
@@ -421,4 +509,157 @@ func printAppRoutes(w io.Writer, appInfo app_examiner.AppInfo) {
 			}
 		}
 	}
+}
+
+func (factory *AppExaminerCommandFactory) printDistributionChart(rate time.Duration) error {
+
+	//Initialize termui
+	err := termui.Init()
+	if err != nil {
+		return errors.New("Unable to initalize terminal graphics mode.")
+		//panic(err)
+	}
+	defer termui.Close()
+	if rate <= time.Duration(0) {
+		rate = graphicalRateDelta
+	}
+
+	termui.UseTheme("helloworld")
+
+	//Initalize some widgets
+	p := termui.NewPar("Lattice Visualization")
+	if p == nil {
+		return errors.New("Error Initializing termui objects NewPar")
+	}
+	p.Height = 1
+	p.Width = 25
+	p.TextFgColor = termui.ColorWhite
+	p.Border.FgColor = termui.ColorWhite
+	p.HasBorder = false
+
+	r := termui.NewPar(fmt.Sprintf("rate:%v", rate))
+	if r == nil {
+		return errors.New("Error Initializing termui objects NewPar")
+	}
+	r.Height = 1
+	r.Width = 10
+	r.TextFgColor = termui.ColorWhite
+	r.Border.FgColor = termui.ColorWhite
+	r.HasBorder = false
+
+	s := termui.NewPar("hit [+=inc; -=dec; q=quit]")
+	if s == nil {
+		return errors.New("Error Initializing termui objects NewPar")
+	}
+	s.Height = 1
+	s.Width = 30
+	s.TextFgColor = termui.ColorWhite
+	s.Border.FgColor = termui.ColorWhite
+	s.HasBorder = false
+
+	bg := termui.NewMBarChart()
+	if bg == nil {
+		return errors.New("Error Initializing termui objects NewMBarChart")
+	}
+	bg.IsDisplay = false
+	bg.Data[0] = []int{0}
+	bg.DataLabels = []string{"1[M]"}
+	bg.Width = termui.TermWidth() - 10
+	bg.Height = termui.TermHeight() - 5
+	bg.BarColor[0] = termui.ColorGreen
+	bg.BarColor[1] = termui.ColorYellow
+	bg.NumColor[0] = termui.ColorRed
+	bg.NumColor[1] = termui.ColorRed
+	bg.TextColor = termui.ColorWhite
+	bg.Border.LabelFgColor = termui.ColorWhite
+	bg.Border.Label = "X-Axis: I[R/T]=CellIndex[Total Instance/Running Instance];[M]=Missing;[E]=Empty"
+	bg.BarWidth = 10
+	bg.BarGap = 1
+
+	//12 column grid system
+	termui.Body.AddRows(termui.NewRow(termui.NewCol(12, 5, p)))
+	termui.Body.AddRows(termui.NewRow(termui.NewCol(12, 0, bg)))
+	termui.Body.AddRows(termui.NewRow(termui.NewCol(6, 0, s), termui.NewCol(6, 5, r)))
+
+	termui.Body.Align()
+
+	termui.Render(termui.Body)
+
+	bg.IsDisplay = true
+	evt := termui.EventCh()
+	for {
+		select {
+		case e := <-evt:
+			if e.Type == termui.EventKey {
+				switch {
+				case (e.Ch == 'q' || e.Ch == 'Q'):
+					return nil
+				case (e.Ch == '+' || e.Ch == '='):
+					rate += graphicalRateDelta
+				case (e.Ch == '_' || e.Ch == '-'):
+					rate -= graphicalRateDelta
+					if rate <= time.Duration(0) {
+						rate = graphicalRateDelta
+					}
+				}
+				r.Text = fmt.Sprintf("rate:%v", rate)
+				termui.Render(termui.Body)
+			}
+			if e.Type == termui.EventResize {
+				termui.Body.Width = termui.TermWidth()
+				termui.Body.Align()
+				termui.Render(termui.Body)
+			}
+		case <-factory.clock.NewTimer(rate).C():
+			err := factory.getProgressBars(bg)
+			if err != nil {
+				return err
+			}
+			termui.Render(termui.Body)
+		}
+	}
+	return nil
+}
+
+func (factory *AppExaminerCommandFactory) getProgressBars(bg *termui.MBarChart) error {
+
+	var barIntList [2][]int
+	var barStringList []string
+
+	var barLabel string
+	maxTotal := -1
+
+	cells, err := factory.appExaminer.ListCells()
+	if err != nil {
+		return err
+	}
+
+	for i, cell := range cells {
+
+		if cell.Missing {
+			barLabel = fmt.Sprintf("%d[M]", i+1)
+
+		} else if cell.RunningInstances == 0 && cell.ClaimedInstances == 0 && !cell.Missing {
+			barLabel = fmt.Sprintf("%d[E]", i+1)
+			barIntList[0] = append(barIntList[0], 0)
+			barIntList[1] = append(barIntList[1], 0)
+		} else {
+
+			total := cell.RunningInstances + cell.ClaimedInstances
+			barIntList[0] = append(barIntList[0], cell.RunningInstances)
+			barIntList[1] = append(barIntList[1], cell.ClaimedInstances)
+			barLabel = fmt.Sprintf("%d[%d/%d]", i+1, cell.RunningInstances, total)
+			if total > maxTotal {
+				maxTotal = total
+			}
+		}
+		barStringList = append(barStringList, barLabel)
+	}
+
+	bg.Data[0] = barIntList[0]
+	bg.Data[1] = barIntList[1]
+	bg.DataLabels = barStringList
+	bg.SetMax(maxTotal + 10)
+
+	return nil
 }
